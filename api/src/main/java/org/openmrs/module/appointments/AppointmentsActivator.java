@@ -39,10 +39,15 @@ public class AppointmentsActivator extends BaseModuleActivator {
 		// Wrapped so a querystore failure does not block module startup; logged at error level so
 		// deployment teams notice in production — a silent failure here means pre-existing
 		// appointments will not appear in querystore search until the underlying issue is fixed.
+		// Catches RuntimeException AND LinkageError so a deployment with version-skewed querystore
+		// classes (NoClassDefFoundError / NoSuchMethodError on missing or renamed SPI symbols) does
+		// not prevent the module from loading. The require_module declaration on querystore does
+		// not pin a version yet (waiting for querystore 1.0), so this guard is load-bearing under
+		// any deployment that drifts on querystore.
 		try {
 			Context.getService(BootstrapService.class).bootstrap(AppointmentSerializer.RESOURCE_TYPE);
 		}
-		catch (RuntimeException e) {
+		catch (RuntimeException | LinkageError e) {
 			log.error("Querystore backfill of " + AppointmentSerializer.RESOURCE_TYPE
 					+ " failed. Steady-state writes will still flow through the AOP bridge, "
 					+ "but pre-existing appointments will not appear in querystore search "

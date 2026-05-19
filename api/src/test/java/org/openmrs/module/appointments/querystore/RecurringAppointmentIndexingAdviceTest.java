@@ -27,11 +27,19 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+/**
+ * Pins {@link RecurringAppointmentIndexingAdvice}'s steady-state contract on
+ * {@code AppointmentRecurringPatternService}: UUID-keyed dedup so a save that surfaces the same
+ * Appointment via both {@code returnValue} and {@code args[0]} doesn't double-index, voided →
+ * delete routing, non-trigger-method ignore, and exception swallow on both the pre-dispatch
+ * (serializer) and dispatch-time (indexer) paths per querystore ADR Decision 12.
+ */
 public class RecurringAppointmentIndexingAdviceTest {
 
 	private RecurringAppointmentIndexingAdvice advice;
@@ -67,7 +75,7 @@ public class RecurringAppointmentIndexingAdviceTest {
 			return null;
 		}).when(dispatcher).dispatch(any(Runnable.class));
 
-		contextMockedStatic = org.mockito.Mockito.mockStatic(Context.class);
+		contextMockedStatic = mockStatic(Context.class);
 		contextMockedStatic.when(() -> Context.getRegisteredComponent(
 				eq(AppointmentIndexingAdvice.SERIALIZER_BEAN_ID), eq(AppointmentSerializer.class)))
 				.thenReturn(serializer);
@@ -175,6 +183,22 @@ public class RecurringAppointmentIndexingAdviceTest {
 		// proxy and the clinical-thread caller. The inner per-document catch covers the dispatch
 		// path; this case covers the pre-dispatch path.
 		doThrow(new RuntimeException("serializer down")).when(serializer).serialize(any(Appointment.class));
+
+		advice.afterReturning(pattern, methodNamed("validateAndSave"), new Object[] { pattern }, null);
+
+		verify(indexer, never()).index(any(QueryDocument.class));
+	}
+
+	@Test
+	public void serializerLinkageErrorDoesNotPropagateToCaller() throws Exception {
+		Appointment one = appointment("uuid-1");
+		AppointmentRecurringPattern pattern = patternOf(one);
+		// LinkageError covers NoClassDefFoundError / NoSuchMethodError that surface when a
+		// deployment lands a querystore version with renamed or removed SPI symbols. Without the
+		// catch widening in afterReturning, the Error would escape past the standard
+		// RuntimeException catch and unwind through the AOP proxy to the clinical-thread save.
+		doThrow(new NoSuchMethodError("ClinicalRecordSerializer.serialize"))
+				.when(serializer).serialize(any(Appointment.class));
 
 		advice.afterReturning(pattern, methodNamed("validateAndSave"), new Object[] { pattern }, null);
 

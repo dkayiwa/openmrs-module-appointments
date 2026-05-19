@@ -72,10 +72,13 @@ public class RecurringAppointmentIndexingAdvice implements AfterReturningAdvice 
 			return;
 		}
 
+		// Swallow RuntimeException AND LinkageError so a version-skewed querystore (renamed or
+		// removed SPI symbols → NoClassDefFoundError / NoSuchMethodError) does not unwind back
+		// through the AOP proxy to a clinical-thread caller whose save has already committed.
 		try {
 			dispatch(appointments);
 		}
-		catch (RuntimeException e) {
+		catch (RuntimeException | LinkageError e) {
 			log.warn(getClass().getSimpleName() + " failed for " + method.getName()
 					+ "; swallowing per querystore ADR Decision 12", e);
 		}

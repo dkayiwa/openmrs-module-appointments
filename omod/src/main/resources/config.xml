@@ -60,6 +60,11 @@
 	</advice>
 
 	<advice>
+		<point>org.openmrs.module.appointments.service.AppointmentsService</point>
+		<class>org.openmrs.module.appointments.querystore.AppointmentProviderResponseIndexingAdvice</class>
+	</advice>
+
+	<advice>
 		<point>org.openmrs.module.appointments.service.AppointmentServiceDefinitionService</point>
 		<class>org.openmrs.module.appointments.advice.AppointmentServiceDefinitionAdvice</class>
 	</advice>

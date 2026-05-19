@@ -29,6 +29,13 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+/**
+ * Pins the {@link AppointmentSerializer} cross-cutting field contract per querystore ADR
+ * Decisions 6 and 13: every populated and intentionally-omitted field listed in the serializer's
+ * Javadoc must match the document this class projects. The regression to guard against is "a
+ * future field rename or reordering silently drops a metadata key" — the failure mode is silent
+ * because querystore happily indexes documents with whatever fields are present.
+ */
 public class AppointmentSerializerTest {
 
 	private static final String APPOINTMENT_UUID = "a-uuid";
