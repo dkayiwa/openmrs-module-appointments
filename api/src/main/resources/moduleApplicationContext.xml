@@ -258,4 +258,21 @@
         </property>
     </bean>
 
+    <!-- Querystore SPI contribution: serializer + bootstrapper + provider bean (ADR Decision 13).
+         Discovered by querystore at bootstrap via Context.getRegisteredComponents(ResourceTypeProvider). -->
+    <bean id="appointments.serializer.appointment"
+          class="org.openmrs.module.appointments.querystore.AppointmentSerializer"/>
+
+    <bean id="appointments.bootstrapper.appointment"
+          class="org.openmrs.module.appointments.querystore.AppointmentBootstrapper">
+        <constructor-arg ref="appointments.serializer.appointment"/>
+        <constructor-arg ref="dbSessionFactory"/>
+    </bean>
+
+    <bean id="appointments.provider.appointment"
+          class="org.openmrs.module.appointments.querystore.AppointmentResourceProvider">
+        <constructor-arg ref="appointments.serializer.appointment"/>
+        <constructor-arg ref="appointments.bootstrapper.appointment"/>
+    </bean>
+
 </beans>
