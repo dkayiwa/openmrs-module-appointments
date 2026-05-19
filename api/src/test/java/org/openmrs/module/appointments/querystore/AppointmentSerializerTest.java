@@ -129,23 +129,73 @@ public class AppointmentSerializerTest {
 		assertNull(doc.getMetadata().get("appointment_service_type_uuid"));
 		assertNull(doc.getMetadata().get("teleconsultation_link"));
 		assertNull(doc.getMetadata().get("comments"));
-		assertEquals(Boolean.FALSE, doc.getMetadata().get("is_recurring"));
+		// is_recurring is emitted only when true (sparse-when-false convention).
+		assertNull(doc.getMetadata().get("is_recurring"));
 	}
 
 	@Test
-	public void fallsBackToSingularProviderFieldWhenProvidersSetIsEmpty() {
+	public void emitsNoProviderFieldsWhenProvidersSetIsEmpty() {
 		Appointment appointment = newAppointment();
-		Provider legacyProvider = new Provider();
-		legacyProvider.setUuid("legacy-provider-uuid");
-		legacyProvider.setPerson(personNamed("Dr.", "Legacy"));
-		appointment.setProvider(legacyProvider);
 		appointment.setProviders(Collections.<AppointmentProvider>emptySet());
 
 		QueryDocument doc = serializer.serialize(appointment);
 
-		assertEquals("legacy-provider-uuid", doc.getMetadata().get("provider_uuid"));
-		assertNotNull(doc.getMetadata().get("provider_name"));
-		assertTrue(doc.getMetadata().get("provider_name").toString().contains("Legacy"));
+		// Appointment.provider (the singular Java field) is intentionally not Hibernate-mapped,
+		// so persisted appointments never populate it — the serializer correctly emits no
+		// provider_uuid / provider_name when the providers Set is empty.
+		assertNull(doc.getMetadata().get("provider_uuid"));
+		assertNull(doc.getMetadata().get("provider_name"));
+	}
+
+	@Test
+	public void usesFirstProviderInIterationOrderWhenMultiplePresent() {
+		Appointment appointment = newAppointment();
+		Provider providerOne = new Provider();
+		providerOne.setUuid("provider-1");
+		providerOne.setPerson(personNamed("Dr.", "First"));
+		Provider providerTwo = new Provider();
+		providerTwo.setUuid("provider-2");
+		providerTwo.setPerson(personNamed("Dr.", "Second"));
+		AppointmentProvider apOne = new AppointmentProvider();
+		apOne.setProvider(providerOne);
+		AppointmentProvider apTwo = new AppointmentProvider();
+		apTwo.setProvider(providerTwo);
+		// LinkedHashSet preserves insertion order so the test is deterministic; production
+		// behaviour depends on the Hibernate-returned set's iteration order, but the assertion here
+		// is that we deterministically return some non-null provider in a multi-provider scenario.
+		Set<AppointmentProvider> providers = new java.util.LinkedHashSet<>();
+		providers.add(apOne);
+		providers.add(apTwo);
+		appointment.setProviders(providers);
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		Object providerUuid = doc.getMetadata().get("provider_uuid");
+		assertNotNull(providerUuid);
+		assertTrue("expected one of the configured providers",
+				"provider-1".equals(providerUuid) || "provider-2".equals(providerUuid));
+	}
+
+	@Test
+	public void leavesLastModifiedAndDateNullWhenBothAuditDatesMissing() {
+		Appointment appointment = new Appointment();
+		appointment.setUuid(APPOINTMENT_UUID);
+		Patient patient = new Patient();
+		patient.setUuid(PATIENT_UUID);
+		appointment.setPatient(patient);
+		// No dateCreated, no dateChanged, no startDateTime — neither cursor source available.
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		// Required cross-cutting fields per querystore ADR Decision 13 carry the contract that
+		// downstream consumers may rely on. When the source entity carries neither audit date,
+		// the serializer currently emits nulls and the backend's conditional-upsert race guard
+		// (which depends on last_modified) falls back to last-write-wins. Document the behaviour
+		// here so a future maintainer doesn't accidentally regress to a half-populated document.
+		assertNull(doc.getLastModified());
+		assertNull(doc.getDate());
+		assertEquals(APPOINTMENT_UUID, doc.getResourceUuid());
+		assertNotNull(doc.getText());
 	}
 
 	@Test

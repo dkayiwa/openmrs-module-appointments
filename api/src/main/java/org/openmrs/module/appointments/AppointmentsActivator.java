@@ -36,14 +36,17 @@ public class AppointmentsActivator extends BaseModuleActivator {
 	public void started() {
 		// Trigger querystore backfill of historical appointments. Idempotent: if the type has a
 		// completed progress row, BootstrapService resumes from the cursor and finds no new work.
-		// Wrapped so an unavailable querystore service doesn't block module startup — provided
-		// querystore is in <require_modules>, this should never throw in practice.
+		// Wrapped so a querystore failure does not block module startup; logged at error level so
+		// deployment teams notice in production — a silent failure here means pre-existing
+		// appointments will not appear in querystore search until the underlying issue is fixed.
 		try {
 			Context.getService(BootstrapService.class).bootstrap(AppointmentSerializer.RESOURCE_TYPE);
 		}
 		catch (RuntimeException e) {
-			log.warn("Querystore backfill of " + AppointmentSerializer.RESOURCE_TYPE
-					+ " failed; steady-state writes still flow through the AOP bridge", e);
+			log.error("Querystore backfill of " + AppointmentSerializer.RESOURCE_TYPE
+					+ " failed. Steady-state writes will still flow through the AOP bridge, "
+					+ "but pre-existing appointments will not appear in querystore search "
+					+ "until this is resolved.", e);
 		}
 	}
 

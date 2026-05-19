@@ -11,10 +11,10 @@ import org.openmrs.module.appointments.model.AppointmentStatus;
 import org.openmrs.module.querystore.model.QueryDocument;
 import org.openmrs.module.querystore.serialization.ClinicalRecordSerializer;
 
-import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.Date;
 import java.util.Set;
 
@@ -34,7 +34,17 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 
 	public static final String RESOURCE_TYPE = "appointments_appointment";
 
+	// Captured at class load. Determines how Date instants project onto the {@code date} field and
+	// the human-readable date/time substrings in {@code text}. Consumers comparing {@code date}
+	// across deployments should align JVM time zones, or the cross-tier {@code querystore_*}
+	// wildcard query may surface the same clinical instant under different calendar dates.
 	private static final ZoneId DOC_ZONE = ZoneId.systemDefault();
+
+	// Thread-safe and reusable; AppointmentSerializer is a Spring singleton serialised concurrently
+	// on the bootstrap backfill path, so per-call SimpleDateFormat instantiation would churn heap.
+	private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(DOC_ZONE);
+
+	private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm").withZone(DOC_ZONE);
 
 	@Override
 	public String getResourceType() {
@@ -55,9 +65,15 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 			doc.setPatientUuid(appointment.getPatient().getUuid());
 		}
 
+		// last_modified drives querystore's conditional-upsert race guard (ADR Decision 3): a
+		// non-null value is required for ordering concurrent writes correctly. Fall back through
+		// dateChanged -> dateCreated -> startDateTime so legacy / test-seeded appointments missing
+		// the audit columns still produce a comparable timestamp.
 		Date lastModifiedDate = appointment.getDateChanged() != null
 				? appointment.getDateChanged()
-				: appointment.getDateCreated();
+				: appointment.getDateCreated() != null
+						? appointment.getDateCreated()
+						: appointment.getStartDateTime();
 		if (lastModifiedDate != null) {
 			doc.setLastModified(lastModifiedDate.toInstant());
 		}
@@ -66,7 +82,6 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 				? appointment.getStartDateTime()
 				: lastModifiedDate;
 		if (clinicalDate != null) {
-			// LocalDate.ofInstant(Instant, ZoneId) is JDK 9+; the module compiles to release 8.
 			doc.setDate(clinicalDate.toInstant().atZone(DOC_ZONE).toLocalDate());
 		}
 
@@ -113,12 +128,14 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 		if (appointment.getComments() != null && !appointment.getComments().isEmpty()) {
 			doc.putMetadata("comments", appointment.getComments());
 		}
-		AppointmentRecurringPattern recurringPattern = appointment.getAppointmentRecurringPattern();
-		doc.putMetadata("is_recurring", recurringPattern != null);
 		// AppointmentRecurringPattern carries only a numeric id (it doesn't extend BaseOpenmrsData
 		// and has no uuid), so the recurring grouping is surfaced only as a boolean flag here.
 		// Consumers wanting all occurrences of a recurrence should query by appointment-service +
-		// patient_uuid and group client-side.
+		// patient_uuid and group client-side. Emitted only when true so non-recurring documents
+		// stay lean — mirrors the conditional emit pattern used for teleconsultation_link / comments.
+		if (appointment.getAppointmentRecurringPattern() != null) {
+			doc.putMetadata("is_recurring", Boolean.TRUE);
+		}
 		if (appointment.getTeleHealthVideoLink() != null
 				&& !appointment.getTeleHealthVideoLink().isEmpty()) {
 			doc.putMetadata("teleconsultation_link", appointment.getTeleHealthVideoLink());
@@ -128,7 +145,10 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 	}
 
 	private String buildText(Appointment a) {
-		StringBuilder sb = new StringBuilder("Appointment");
+		// Typical rendered text runs ~80-160 chars (service + type + date/time window + provider +
+		// location + status + kind). Pre-sizing avoids the 2-3 grow/copy cycles the default capacity
+		// of 16 would incur on every serialize() call on the bootstrap backfill path.
+		StringBuilder sb = new StringBuilder(192).append("Appointment");
 		if (a.getService() != null && a.getService().getName() != null) {
 			sb.append(" for ").append(a.getService().getName());
 		}
@@ -136,12 +156,11 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 			sb.append(" (").append(a.getServiceType().getName()).append(')');
 		}
 		if (a.getStartDateTime() != null) {
-			SimpleDateFormat dateFmt = new SimpleDateFormat("yyyy-MM-dd");
-			SimpleDateFormat timeFmt = new SimpleDateFormat("HH:mm");
-			sb.append(" on ").append(dateFmt.format(a.getStartDateTime()));
-			sb.append(" at ").append(timeFmt.format(a.getStartDateTime()));
+			Instant start = a.getStartDateTime().toInstant();
+			sb.append(" on ").append(DATE_FORMAT.format(start));
+			sb.append(" at ").append(TIME_FORMAT.format(start));
 			if (a.getEndDateTime() != null) {
-				sb.append('-').append(timeFmt.format(a.getEndDateTime()));
+				sb.append('-').append(TIME_FORMAT.format(a.getEndDateTime().toInstant()));
 			}
 		}
 		Provider provider = resolvePrimaryProvider(a);
@@ -170,19 +189,26 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 	}
 
 	/**
-	 * Appointments carry both a singular {@code provider} field (legacy) and a {@code providers} set
-	 * (current). The set is canonical when populated; the singular field is a fallback for older
-	 * data that has not been migrated.
+	 * Resolves the appointment's primary provider from the {@code providers} set. Returns the
+	 * first non-null provider in iteration order; with multiple providers on a single appointment,
+	 * this is the first one Hibernate hands back from the {@code patient_appointment_provider}
+	 * join (effectively insertion order under the default mapping). Multi-provider appointments
+	 * are rare in practice; clients needing the full set can read the entity directly.
+	 *
+	 * <p>Note: {@code Appointment} also has a singular {@code provider} field on the Java class,
+	 * but it is intentionally not Hibernate-mapped (see {@code Appointment.hbm.xml}) — persisted
+	 * appointments never populate it, so it is not consulted here.
 	 */
 	private Provider resolvePrimaryProvider(Appointment a) {
 		Set<AppointmentProvider> providers = a.getProviders();
-		if (providers != null) {
-			for (AppointmentProvider ap : providers) {
-				if (ap != null && ap.getProvider() != null) {
-					return ap.getProvider();
-				}
+		if (providers == null) {
+			return null;
+		}
+		for (AppointmentProvider ap : providers) {
+			if (ap != null && ap.getProvider() != null) {
+				return ap.getProvider();
 			}
 		}
-		return a.getProvider();
+		return null;
 	}
 }

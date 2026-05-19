@@ -55,6 +55,11 @@
 	</advice>
 
 	<advice>
+		<point>org.openmrs.module.appointments.service.AppointmentRecurringPatternService</point>
+		<class>org.openmrs.module.appointments.querystore.RecurringAppointmentIndexingAdvice</class>
+	</advice>
+
+	<advice>
 		<point>org.openmrs.module.appointments.service.AppointmentServiceDefinitionService</point>
 		<class>org.openmrs.module.appointments.advice.AppointmentServiceDefinitionAdvice</class>
 	</advice>
