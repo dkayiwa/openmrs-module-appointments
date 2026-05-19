@@ -110,11 +110,20 @@ public class AppointmentSerializerTest {
 		assertNotNull(doc.getMetadata().get("provider_name"));
 		assertTrue(doc.getMetadata().get("provider_name").toString().contains("Adams"));
 		assertEquals("loc-uuid", doc.getMetadata().get("location_uuid"));
+		assertEquals("OPD Room 4", doc.getMetadata().get("location_name"));
 		assertEquals("svc-uuid", doc.getMetadata().get("appointment_service_uuid"));
+		assertEquals("Cardiology", doc.getMetadata().get("appointment_service_name"));
 		assertEquals("svctype-uuid", doc.getMetadata().get("appointment_service_type_uuid"));
+		assertEquals("Follow-up", doc.getMetadata().get("appointment_service_type_name"));
 		assertEquals("APPT-001", doc.getMetadata().get("appointment_number"));
 		assertEquals("Scheduled", doc.getMetadata().get("status"));
 		assertEquals("Scheduled", doc.getMetadata().get("appointment_kind"));
+		// start_date_time and end_date_time use ISO-8601 instant format from the appointment's
+		// java.util.Date.toInstant().toString(); the fixture in newAppointment() pins these to
+		// June 1, 2026 10:00 / 10:30 UTC. Asserting the exact strings guards against a typo or
+		// format drift that would silently change the wire shape consumers parse.
+		assertEquals("2026-06-01T10:00:00Z", doc.getMetadata().get("start_date_time"));
+		assertEquals("2026-06-01T10:30:00Z", doc.getMetadata().get("end_date_time"));
 		assertEquals(Boolean.TRUE, doc.getMetadata().get("is_recurring"));
 		assertEquals("https://meet.example.org/abc", doc.getMetadata().get("teleconsultation_link"));
 		assertEquals("Patient prefers morning slots", doc.getMetadata().get("comments"));
@@ -235,6 +244,20 @@ public class AppointmentSerializerTest {
 		assertFalse(doc.getText().contains("Teleconsultation"));
 	}
 
+	/**
+	 * Calendar.set(...) does not zero the milliseconds field, so the resulting Date inherits the
+	 * wall-clock millis from when the Calendar was constructed. That makes serialised instant
+	 * strings (e.g. {@code start_date_time}) drift run-to-run and breaks deterministic assertions.
+	 * Helper explicitly zeros millis so the instant strings render as {@code 2026-06-01T10:00:00Z}
+	 * not {@code 2026-06-01T10:00:00.290Z}.
+	 */
+	private Date utcDate(int year, int month, int day, int hour, int minute, int second) {
+		Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+		cal.set(year, month, day, hour, minute, second);
+		cal.set(Calendar.MILLISECOND, 0);
+		return cal.getTime();
+	}
+
 	private Person personNamed(String given, String family) {
 		Person person = new Person();
 		PersonName name = new PersonName(given, null, family);
@@ -250,21 +273,10 @@ public class AppointmentSerializerTest {
 		patient.setUuid(PATIENT_UUID);
 		appointment.setPatient(patient);
 
-		Calendar created = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-		created.set(2026, Calendar.JANUARY, 10, 9, 0, 0);
-		appointment.setDateCreated(created.getTime());
-
-		Calendar changed = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-		changed.set(2026, Calendar.JANUARY, 11, 9, 0, 0);
-		appointment.setDateChanged(changed.getTime());
-
-		Calendar start = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-		start.set(2026, Calendar.JUNE, 1, 10, 0, 0);
-		appointment.setStartDateTime(start.getTime());
-
-		Calendar end = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-		end.set(2026, Calendar.JUNE, 1, 10, 30, 0);
-		appointment.setEndDateTime(end.getTime());
+		appointment.setDateCreated(utcDate(2026, Calendar.JANUARY, 10, 9, 0, 0));
+		appointment.setDateChanged(utcDate(2026, Calendar.JANUARY, 11, 9, 0, 0));
+		appointment.setStartDateTime(utcDate(2026, Calendar.JUNE, 1, 10, 0, 0));
+		appointment.setEndDateTime(utcDate(2026, Calendar.JUNE, 1, 10, 30, 0));
 
 		return appointment;
 	}
