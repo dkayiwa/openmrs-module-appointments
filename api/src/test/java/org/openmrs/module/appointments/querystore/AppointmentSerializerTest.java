@@ -10,16 +10,21 @@ import org.openmrs.Provider;
 import org.openmrs.module.appointments.model.Appointment;
 import org.openmrs.module.appointments.model.AppointmentKind;
 import org.openmrs.module.appointments.model.AppointmentProvider;
+import org.openmrs.module.appointments.model.AppointmentProviderResponse;
 import org.openmrs.module.appointments.model.AppointmentRecurringPattern;
 import org.openmrs.module.appointments.model.AppointmentServiceDefinition;
 import org.openmrs.module.appointments.model.AppointmentServiceType;
 import org.openmrs.module.appointments.model.AppointmentStatus;
+import org.openmrs.module.appointments.service.impl.RecurringAppointmentType;
 import org.openmrs.module.querystore.model.QueryDocument;
 
+import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.TimeZone;
 
@@ -62,7 +67,13 @@ public class AppointmentSerializerTest {
 		appointment.setAppointmentKind(AppointmentKind.Scheduled);
 		appointment.setComments("Patient prefers morning slots");
 		appointment.setTeleHealthVideoLink("https://meet.example.org/abc");
-		appointment.setAppointmentRecurringPattern(new AppointmentRecurringPattern());
+		AppointmentRecurringPattern recurringPattern = new AppointmentRecurringPattern();
+		recurringPattern.setType(RecurringAppointmentType.WEEK);
+		recurringPattern.setPeriod(2);
+		recurringPattern.setFrequency(6);
+		recurringPattern.setDaysOfWeek("MON,WED");
+		recurringPattern.setEndDate(utcDate(2026, Calendar.AUGUST, 30, 0, 0, 0));
+		appointment.setAppointmentRecurringPattern(recurringPattern);
 
 		AppointmentServiceDefinition service = new AppointmentServiceDefinition();
 		service.setUuid("svc-uuid");
@@ -84,6 +95,7 @@ public class AppointmentSerializerTest {
 		provider.setPerson(personNamed("Dr.", "Adams"));
 		AppointmentProvider appointmentProvider = new AppointmentProvider();
 		appointmentProvider.setProvider(provider);
+		appointmentProvider.setResponse(AppointmentProviderResponse.ACCEPTED);
 		Set<AppointmentProvider> providers = new HashSet<>();
 		providers.add(appointmentProvider);
 		appointment.setProviders(providers);
@@ -125,8 +137,20 @@ public class AppointmentSerializerTest {
 		assertEquals("2026-06-01T10:00:00Z", doc.getMetadata().get("start_date_time"));
 		assertEquals("2026-06-01T10:30:00Z", doc.getMetadata().get("end_date_time"));
 		assertEquals(Boolean.TRUE, doc.getMetadata().get("is_recurring"));
+		assertEquals("WEEK", doc.getMetadata().get("recurring_type"));
+		assertEquals(2, doc.getMetadata().get("recurring_period"));
+		assertEquals(6, doc.getMetadata().get("recurring_frequency"));
+		assertEquals("MON,WED", doc.getMetadata().get("recurring_days_of_week"));
+		assertEquals("2026-08-30T00:00:00Z", doc.getMetadata().get("recurring_end_date"));
 		assertEquals("https://meet.example.org/abc", doc.getMetadata().get("teleconsultation_link"));
 		assertEquals("Patient prefers morning slots", doc.getMetadata().get("comments"));
+		// Multi-provider surface: the single provider in the fixture is still in the *_list fields.
+		assertEquals(Arrays.asList("provider-uuid"), doc.getMetadata().get("provider_uuids"));
+		List<?> singleProviderNames = (List<?>) doc.getMetadata().get("provider_names");
+		assertEquals(1, singleProviderNames.size());
+		assertTrue(singleProviderNames.get(0).toString().contains("Adams"));
+		assertEquals(Arrays.asList("provider-uuid:ACCEPTED"),
+				doc.getMetadata().get("provider_responses"));
 	}
 
 	@Test
@@ -161,6 +185,55 @@ public class AppointmentSerializerTest {
 		// provider_uuid / provider_name when the providers Set is empty.
 		assertNull(doc.getMetadata().get("provider_uuid"));
 		assertNull(doc.getMetadata().get("provider_name"));
+	}
+
+	@Test
+	public void surfacesEveryProviderAndResponseForMultiProviderAppointments() {
+		Appointment appointment = newAppointment();
+		Provider providerOne = new Provider();
+		providerOne.setUuid("provider-1");
+		providerOne.setPerson(personNamed("Dr.", "Alpha"));
+		Provider providerTwo = new Provider();
+		providerTwo.setUuid("provider-2");
+		providerTwo.setPerson(personNamed("Dr.", "Beta"));
+		Provider providerThree = new Provider();
+		providerThree.setUuid("provider-3");
+		providerThree.setPerson(personNamed("Dr.", "Gamma"));
+
+		AppointmentProvider apOne = new AppointmentProvider();
+		apOne.setProvider(providerOne);
+		apOne.setResponse(AppointmentProviderResponse.ACCEPTED);
+		AppointmentProvider apTwo = new AppointmentProvider();
+		apTwo.setProvider(providerTwo);
+		apTwo.setResponse(AppointmentProviderResponse.REJECTED);
+		AppointmentProvider apThree = new AppointmentProvider();
+		apThree.setProvider(providerThree);
+		// providerThree has no response yet (e.g. AWAITING semantics modelled as null)
+
+		// LinkedHashSet preserves insertion order so the assertions are deterministic; production
+		// uses Hibernate's set ordering which is not stable but the *list* surface is what
+		// guarantees the search-correct coverage regardless.
+		Set<AppointmentProvider> providers = new LinkedHashSet<>();
+		providers.add(apOne);
+		providers.add(apTwo);
+		providers.add(apThree);
+		appointment.setProviders(providers);
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		// Every provider UUID must appear — a consumer searching "appointments with provider-3"
+		// would miss this record entirely if only the primary were indexed.
+		assertEquals(Arrays.asList("provider-1", "provider-2", "provider-3"),
+				doc.getMetadata().get("provider_uuids"));
+		List<?> names = (List<?>) doc.getMetadata().get("provider_names");
+		assertEquals(3, names.size());
+
+		// Per-provider responses encoded as "<uuid>:<response>" so consumers can filter on
+		// "where Dr. X has declined" without nested-object indexing. Providers with no response
+		// recorded yet are omitted entirely; the consumer can derive "awaiting" by set difference
+		// against provider_uuids.
+		assertEquals(Arrays.asList("provider-1:ACCEPTED", "provider-2:REJECTED"),
+				doc.getMetadata().get("provider_responses"));
 	}
 
 	@Test

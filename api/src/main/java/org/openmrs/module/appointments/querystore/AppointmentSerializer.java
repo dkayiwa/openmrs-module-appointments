@@ -15,7 +15,9 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -87,10 +89,32 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 
 		doc.setText(buildText(appointment));
 
-		Provider primaryProvider = resolvePrimaryProvider(appointment);
-		if (primaryProvider != null) {
+		// Provider surface — single-valued "primary" fields keep backward-compatibility with the
+		// querystore cross-cutting convention; the *_list fields are the search-correct surface
+		// for multi-provider appointments. Without the lists, a query for "appointments with
+		// Dr. C" silently misses every record where Dr. C isn't first in HashSet iteration order.
+		List<Provider> resolvedProviders = resolveProviders(appointment);
+		if (!resolvedProviders.isEmpty()) {
+			Provider primaryProvider = resolvedProviders.get(0);
 			doc.putMetadata("provider_uuid", primaryProvider.getUuid());
 			doc.putMetadata("provider_name", primaryProvider.getName());
+
+			List<String> providerUuids = new ArrayList<>(resolvedProviders.size());
+			List<String> providerNames = new ArrayList<>(resolvedProviders.size());
+			for (Provider provider : resolvedProviders) {
+				providerUuids.add(provider.getUuid());
+				providerNames.add(provider.getName());
+			}
+			doc.putMetadata("provider_uuids", providerUuids);
+			doc.putMetadata("provider_names", providerNames);
+
+			// Per-provider response (ACCEPTED / REJECTED / AWAITING) is what the
+			// updateAppointmentProviderResponse trigger surface mutates. Surfacing it as a
+			// UUID→response array lets consumers query "appointments where Dr. X has declined."
+			List<String> providerResponses = collectProviderResponses(appointment);
+			if (!providerResponses.isEmpty()) {
+				doc.putMetadata("provider_responses", providerResponses);
+			}
 		}
 		Location location = appointment.getLocation();
 		if (location != null) {
@@ -129,12 +153,29 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 			doc.putMetadata("comments", appointment.getComments());
 		}
 		// AppointmentRecurringPattern carries only a numeric id (it doesn't extend BaseOpenmrsData
-		// and has no uuid), so the recurring grouping is surfaced only as a boolean flag here.
-		// Consumers wanting all occurrences of a recurrence should query by appointment-service +
-		// patient_uuid and group client-side. Emitted only when true so non-recurring documents
-		// stay lean — mirrors the conditional emit pattern used for teleconsultation_link / comments.
-		if (appointment.getAppointmentRecurringPattern() != null) {
+		// and has no uuid), so the recurring grouping is surfaced as a boolean flag plus the
+		// pattern's structured shape (type, period, frequency, daysOfWeek, endDate). Without these,
+		// reporting tools can ask "any recurring?" but not "weekly recurring on Mondays."
+		// Consumers wanting all occurrences of a single recurrence still need to query by
+		// appointment-service + patient_uuid and group client-side; the pattern itself has no UUID.
+		AppointmentRecurringPattern recurringPattern = appointment.getAppointmentRecurringPattern();
+		if (recurringPattern != null) {
 			doc.putMetadata("is_recurring", Boolean.TRUE);
+			if (recurringPattern.getType() != null) {
+				doc.putMetadata("recurring_type", recurringPattern.getType().name());
+			}
+			if (recurringPattern.getPeriod() != null) {
+				doc.putMetadata("recurring_period", recurringPattern.getPeriod());
+			}
+			if (recurringPattern.getFrequency() != null) {
+				doc.putMetadata("recurring_frequency", recurringPattern.getFrequency());
+			}
+			if (recurringPattern.getDaysOfWeek() != null && !recurringPattern.getDaysOfWeek().isEmpty()) {
+				doc.putMetadata("recurring_days_of_week", recurringPattern.getDaysOfWeek());
+			}
+			if (recurringPattern.getEndDate() != null) {
+				doc.putMetadata("recurring_end_date", recurringPattern.getEndDate().toInstant().toString());
+			}
 		}
 		if (appointment.getTeleHealthVideoLink() != null
 				&& !appointment.getTeleHealthVideoLink().isEmpty()) {
@@ -163,9 +204,9 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 				sb.append('-').append(TIME_FORMAT.format(a.getEndDateTime().toInstant()));
 			}
 		}
-		Provider provider = resolvePrimaryProvider(a);
-		if (provider != null && provider.getName() != null) {
-			sb.append(" with ").append(provider.getName());
+		List<Provider> providers = resolveProviders(a);
+		if (!providers.isEmpty() && providers.get(0).getName() != null) {
+			sb.append(" with ").append(providers.get(0).getName());
 		}
 		if (a.getLocation() != null && a.getLocation().getName() != null) {
 			sb.append(" at ").append(a.getLocation().getName());
@@ -189,26 +230,49 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 	}
 
 	/**
-	 * Resolves the appointment's primary provider from the {@code providers} set. Returns the
-	 * first non-null provider in iteration order; with multiple providers on a single appointment,
-	 * this is the first one Hibernate hands back from the {@code patient_appointment_provider}
-	 * join (effectively insertion order under the default mapping). Multi-provider appointments
-	 * are rare in practice; clients needing the full set can read the entity directly.
+	 * Returns every non-null {@link Provider} attached to the appointment, in Hibernate iteration
+	 * order. The first element is treated as the primary provider for the legacy
+	 * {@code provider_uuid} / {@code provider_name} cross-cutting fields; the full list is what
+	 * the multi-valued {@code provider_uuids} / {@code provider_names} metadata fields surface for
+	 * search.
 	 *
 	 * <p>Note: {@code Appointment} also has a singular {@code provider} field on the Java class,
 	 * but it is intentionally not Hibernate-mapped (see {@code Appointment.hbm.xml}) — persisted
 	 * appointments never populate it, so it is not consulted here.
 	 */
-	private Provider resolvePrimaryProvider(Appointment a) {
+	private List<Provider> resolveProviders(Appointment a) {
 		Set<AppointmentProvider> providers = a.getProviders();
 		if (providers == null) {
-			return null;
+			return new ArrayList<>(0);
 		}
+		List<Provider> resolved = new ArrayList<>(providers.size());
 		for (AppointmentProvider ap : providers) {
 			if (ap != null && ap.getProvider() != null) {
-				return ap.getProvider();
+				resolved.add(ap.getProvider());
 			}
 		}
-		return null;
+		return resolved;
+	}
+
+	/**
+	 * Collects each provider's response (ACCEPTED / REJECTED / AWAITING) keyed by the provider's
+	 * UUID. Format: {@code "<provider-uuid>:<response>"} per entry so the metadata reads as a
+	 * flat array of opaque strings rather than requiring nested-object indexing — the latter is
+	 * not uniformly supported across querystore's three reference backends. A null response is
+	 * skipped (some providers haven't been asked yet) rather than encoded as the string "null".
+	 */
+	private List<String> collectProviderResponses(Appointment a) {
+		Set<AppointmentProvider> providers = a.getProviders();
+		if (providers == null) {
+			return new ArrayList<>(0);
+		}
+		List<String> responses = new ArrayList<>(providers.size());
+		for (AppointmentProvider ap : providers) {
+			if (ap == null || ap.getProvider() == null || ap.getResponse() == null) {
+				continue;
+			}
+			responses.add(ap.getProvider().getUuid() + ":" + ap.getResponse().name());
+		}
+		return responses;
 	}
 }
