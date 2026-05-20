@@ -32,7 +32,8 @@ This module's contribution is a single resource type, `appointments_appointment`
 14. [`text` chunk composition: clinical prose only, no audit metadata](#decision-14-text-chunk-composition-clinical-prose-only-no-audit-metadata)
 15. [`DOC_ZONE` = JVM-default timezone, captured at class load](#decision-15-doc_zone--jvm-default-timezone-captured-at-class-load)
 16. [Bean discovery via `Context.getRegisteredComponent`, not Spring `@Autowired`](#decision-16-bean-discovery-via-contextgetregisteredcomponent-not-spring-autowired)
-17. [Open questions](#open-questions)
+17. [Sync via AOP advice, not Atomfeed event subscription](#decision-17-sync-via-aop-advice-not-atomfeed-event-subscription)
+18. [Open questions](#open-questions)
 
 ---
 
@@ -544,6 +545,38 @@ The serializer bean ID is captured as a package-visible constant (`AppointmentIn
 - A future contributor seeing the per-invocation lookups and "simplifying" to `@Autowired` would break the module silently. The pattern is documented here so the next maintainer reads the constraint before the refactor.
 - A rename of any of the three bean IDs (`appointments.serializer.appointment`, `querystore.bridge.indexer`, `querystore.bridge.dispatcher`) is a coordinated change across `moduleApplicationContext.xml`, the constant definitions, and the test fixtures. The tests stub `Context.getRegisteredComponent` via `MockedStatic<Context>` referencing the same constants, so the rename surfaces at test time rather than at production fire-time.
 - Querystore's own `<bean id="querystore.bridge.indexer">` and `<bean id="querystore.bridge.dispatcher">` IDs are part of its de-facto public SPI. A rename upstream is a breaking change; this module's `<require_module>` declaration (see [Decision 7](#decision-7-require_module-querystore-no-version-pin-while-snapshot)) plus the `LinkageError` catch widening (see [Decision 11](#decision-11-linkageerror-catch-widening-for-version-skew-tolerance)) form the safety net.
+
+---
+
+## Decision 17: Sync via AOP advice, not Atomfeed event subscription
+
+### Status
+Accepted (follows qsADR-12's gap-filler pattern; deferred to events-first when querystore's SPI grows an event hook).
+
+### Context
+Querystore's [qsADR-12](https://github.com/openmrs/openmrs-module-querystore/blob/main/docs/adr.md) prefers an **events-first** sync mechanism: contributing modules subscribe to a durable event stream and project records on event delivery. AOP advice is the **last-resort gap-filler** for services that don't yet emit events. qsADR-13 echoes the same model for module contributions: *"a providing module installed after querystore is picked up without restart"* via Spring discovery, but the trigger mechanism (event vs AOP) is the contributor's choice and time-bound.
+
+The appointments module already has Atomfeed event advices (`AppointmentAdvice`, `AppointmentServiceDefinitionAdvice`, `RecurringAppointmentsAdvice`) that publish events on the same trigger surface — `validateAndSave`, `changeStatus`, `undoStatusChange`, and the recurring-pattern equivalents. Subscribing querystore to those events was a real alternative.
+
+| Approach | Coupling | Failure mode under partition |
+|---|---|---|
+| AOP advice (current) | In-process Spring AOP proxy on `AppointmentsService` / `AppointmentRecurringPatternService` | Synchronous; fires inside the originating transaction. Self-invocation gap (Decision 8). |
+| Atomfeed event subscription | Cross-process; events delivered through the openmrs-atomfeed broker | Broker restart loses events (qsADR-12 calls this out); coupling to the openmrs-atomfeed module |
+| Both | Belt-and-suspenders | Risk of double-indexing if dedup logic is incomplete |
+
+### Decision
+Use pure AOP advice for v1. Three advice classes wired on the two appointment services (see [Decision 3](#decision-3-three-aop-advices-one-per-trigger-surface-shape)). Atomfeed event subscription is deferred until querystore's SPI grows an explicit event-subscription hook per qsADR-12's roadmap.
+
+### Rationale
+1. **Matches qsADR-12's gap-filler pattern.** Querystore's own core-type indexing uses AOP advice today; switching to events is the planned upstream evolution. Adopting events ahead of querystore's own SPI growth would mean writing a custom event-subscriber on the slice side, which is exactly the parallel infrastructure [Decision 1](#decision-1-contribute-via-the-querystore-spi-rather-than-maintain-a-per-module-read-store) rejects.
+2. **AOP fires synchronously in the originating transaction**, so the serializer reads from the same Hibernate session that just persisted the entity. Lazy collections (e.g. `pattern.getAppointments()`) resolve cleanly. An event-driven subscriber would re-fetch by UUID — adding a round-trip and the risk of seeing stale state if the event delivery races with cache eviction.
+3. **Coupling to openmrs-atomfeed is already optional.** The atomfeed module is `<aware_of_module>` in the appointments `config.xml` — making it required for querystore sync would force every querystore-using deployment to also install atomfeed, even those not using event publishing for any other purpose. That's a coupling change with a real deployment-side cost.
+4. **The self-invocation gap (Decision 8) is the same under either mechanism**: Atomfeed's `AppointmentAdvice` has the identical `validateAndSave/changeStatus/undoStatusChange/reschedule` trigger surface and the same self-invocation blindness for `reschedule`'s inner `changeStatus(prev, Cancelled)` call. Switching to events doesn't fix the gap — only rewiring `AppointmentsServiceImpl.reschedule` to call through `Context.getService(AppointmentsService.class)` does.
+
+### Consequences
+- AOP advice does not survive direct DAO writes (a future module-level Liquibase migration or direct SQL would silently bypass both Atomfeed and querystore indexing). qsADR-12 documents this as the broader open question; reconciliation cycles or events-first sync are the upstream fixes.
+- A `RuntimeException` or `LinkageError` from a bridge dependency on the AOP-fire path is swallowed inside the advice's catch (see [Decision 11](#decision-11-linkageerror-catch-widening-for-version-skew-tolerance)) — the originating transaction has already committed, so unwinding would surface a phantom failure to the clinical-thread caller. Event-driven subscribers don't face this constraint because their failure path is the broker's redelivery / dead-letter queue, not the originating transaction.
+- **Follow-up**: when querystore ships an event-subscription hook in its SPI, this advice triple becomes the migration target. The contract is the same (project the entity through `AppointmentSerializer`, dispatch through the bridge), so the migration is mechanical: replace the `<advice>` blocks with event subscriptions, retire the `AfterReturningAdvice` implementations. The serializer and bootstrapper are reusable as-is.
 
 ---
 
