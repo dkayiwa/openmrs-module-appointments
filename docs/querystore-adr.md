@@ -27,7 +27,11 @@ This module's contribution is a single resource type, `appointments_appointment`
 9. [`AppointmentAudit` history not indexed in this resource type](#decision-9-appointmentaudit-history-not-indexed-in-this-resource-type)
 10. [Voided appointments route to delete, not to a `voided=true` field](#decision-10-voided-appointments-route-to-delete-not-to-a-voidedtrue-field)
 11. [LinkageError catch widening for version-skew tolerance](#decision-11-linkageerror-catch-widening-for-version-skew-tolerance)
-12. [Open questions](#open-questions)
+12. [Bootstrap is activator-triggered on every module start](#decision-12-bootstrap-is-activator-triggered-on-every-module-start)
+13. [Cross-cutting `date` field = `startDateTime`](#decision-13-cross-cutting-date-field--startdatetime)
+14. [`text` chunk composition: clinical prose only, no audit metadata](#decision-14-text-chunk-composition-clinical-prose-only-no-audit-metadata)
+15. [`DOC_ZONE` = JVM-default timezone, captured at class load](#decision-15-doc_zone--jvm-default-timezone-captured-at-class-load)
+16. [Open questions](#open-questions)
 
 ---
 
@@ -363,6 +367,145 @@ Every catch site in our advices and activator catches `RuntimeException | Linkag
 ### Consequences
 - A `LinkageError` from inside querystore's own runtime path lands in our `log.warn` instead of unwinding to the clinical-thread caller. Deployment teams see the symptom in logs.
 - The `AppointmentIndexingAdvice` asymmetry remains. The structural fixes are (a) version-pin querystore, or (b) submit an upstream patch widening `AbstractIndexingAdvice`'s catch to `RuntimeException | LinkageError`. Both are out of slice scope.
+
+---
+
+## Decision 12: Bootstrap is activator-triggered on every module start
+
+### Status
+Accepted.
+
+### Context
+Once querystore is installed and this module loads, the `querystore_appointments_appointment` index needs to be populated from the source-of-truth table. Querystore's `BootstrapService.bootstrap("appointments_appointment")` is the entry point that walks the table via the `AppointmentBootstrapper`'s paginated HQL. The question is who triggers it. Three options:
+
+| Option | Triggered by | Trade-off |
+|---|---|---|
+| Activator `started()` | Auto on every module load | Zero-touch; fires on every restart |
+| Admin invocation | Manual REST/SQL/CLI | One-time on install; requires runbook for upgrades |
+| First-search lazy projection | Querystore's `ensureIndexed` on cold `searchByPatient` | Async warmup; latency cost on first query per patient |
+
+### Decision
+The activator's `started()` callback calls `BootstrapService.bootstrap(AppointmentSerializer.RESOURCE_TYPE)` on every module start. The call is wrapped in a `RuntimeException | LinkageError` catch (see [Decision 11](#decision-11-linkageerror-catch-widening-for-version-skew-tolerance)) so a querystore failure logs at error level and module load continues.
+
+### Rationale
+1. **Idempotent on querystore's side.** `BootstrapService.bootstrap(...)` persists a progress row; subsequent invocations resume from the cursor. After the first complete pass, every later call walks zero pages and re-sets COMPLETED — no re-projection cost, no risk of duplicate writes (the conditional-upsert guard from qsADR-3 absorbs any race).
+2. **Zero-touch for deployment teams.** Fresh installs and module upgrades both work without an explicit admin command. The alternative (admin-triggered) means a documentation/runbook obligation and a window where the index is empty until someone notices.
+3. **Lazy projection is a complement, not a replacement.** Querystore's `ensureIndexed` (cold-search-triggered, per-patient) is meant for deployments without scheduled backfill; we still want bulk backfill to be the default so common queries don't pay the first-touch latency.
+
+### Consequences
+- A misconfigured deployment with querystore returning errors logs at error level on every module restart, not just once when first noticed. Deployment teams must monitor for the recurring log line.
+- A module reinstall on a deployment with completed bootstrap is a no-op from the slice's perspective — the activator call resumes from the cursor end-of-data and exits in milliseconds. No risk of double-projection.
+- If the underlying querystore backend is unreachable at module-start time, the swallow logs the error and the module loads anyway. Steady-state writes flow through the AOP advices once the backend recovers; the pre-existing rows remain stale until the next module restart picks up the bootstrap call again.
+
+---
+
+## Decision 13: Cross-cutting `date` field = `startDateTime`
+
+### Status
+Accepted.
+
+### Context
+Querystore's cross-cutting field contract names `date` (a `LocalDate`) as the clinical date of the event (qsADR-6). For an appointment, three candidate timestamps could fill that slot:
+
+| Candidate | What it represents |
+|---|---|
+| `startDateTime` | When the appointment is scheduled to happen |
+| `dateChanged` ?? `dateCreated` | When the appointment record was last modified or created |
+| `dateCreated` only | When the appointment record was created |
+
+The choice affects every date-range query against the index.
+
+### Decision
+`date` = `startDateTime.toInstant().atZone(DOC_ZONE).toLocalDate()`. Modification timestamps are in `last_modified` (cross-cutting Instant) and the appointment-specific `date_created` (passthrough). The audit-shape "when was this record created/modified" question is answered by `date_created` / `last_modified`; the clinical-shape "when is the appointment" question is answered by `date`.
+
+### Rationale
+1. **Matches the user mental model.** A clinician asking "today's appointments" means today's *scheduled* appointments, not appointments edited today. A consumer's `date:today` query expects the same.
+2. **Querystore consumers issuing cross-type date-range queries** (e.g. "show me everything clinical that happened on Tuesday") want the event date, not the audit-trail date. Appointments contributing audit-trail dates instead of event dates would distort cross-type retrieval.
+3. **`date_created` is a separate addressable field** for the "created today" use case, so the audit-shape query is still expressible — just via a different field.
+
+### Consequences
+- Searches by `date` return appointments scheduled for that date, regardless of when they were created or last modified. An appointment created Monday for Tuesday surfaces in `date:Tuesday`, not `date:Monday`.
+- An appointment with `startDateTime=null` (rare; only present in transient/incomplete states) falls back through the chain to `lastModifiedDate` (see [Decision 5](#decision-5-recurring-pattern-structure-surfaced-as-flat-metadata-no-pattern-uuid)'s sibling fallback). The serializer pins this with `fallsBackFromStartDateTimeToLastModifiedForClinicalDate`.
+- The fallback means "create-only" appointments (no start time set) still surface in date-range queries via their audit date — preventing them from being lost entirely. Consumers strictly filtering to scheduled events accept this minor imprecision because the alternative is silent omission.
+
+---
+
+## Decision 14: `text` chunk composition: clinical prose only, no audit metadata
+
+### Status
+Accepted.
+
+### Context
+The serializer produces both structured metadata fields and a natural-language `text` chunk. The `text` is what querystore embeds at write time (qsADR-8) for kNN semantic search; metadata is for structured filtering. Including a field in `text` makes it discoverable via prose similarity ("find appointments mentioning chest pain"); excluding it from `text` confines the field to exact-match filter queries.
+
+The composition choice is a real trade-off. Including audit metadata in `text` would let consumers search "appointments Dr. Admin created" via the embedded prose. Excluding it confines that query to structured filter syntax (`creator_uuid:...`). Including too much narrative dilutes the embedding signal for clinical queries.
+
+### Decision
+`text` contains clinical prose only:
+
+- Service name and service type
+- Scheduled date and time window
+- Primary provider name (with UUID fallback per [Decision 6](#decision-6-omit-on-null-for-entity-name-fields-uuid-fallback-for-provider-names))
+- Location name
+- Status (`name()` of the enum)
+- Kind (`name()` of the enum)
+- "Teleconsultation" marker when teleHealthVideoLink is set
+- "Recurring" marker when any recurring pattern is present
+- Free-text comments
+
+`text` deliberately excludes:
+
+- `creator_uuid` / `changed_by_uuid` (audit metadata)
+- `date_created` (audit timestamp)
+- `provider_uuids` / `provider_names` / `provider_responses` (multi-valued surface — primary provider is in text; the full set is filter-only)
+- `related_appointment_uuid` (relational traversal target)
+- All `recurring_*` structured fields (the boolean "Recurring" marker is in text; the structured shape is filter-only)
+
+### Rationale
+1. **Embedding similarity is most useful when the prose matches how a clinician describes an appointment.** "Cardiology follow-up with Dr. Adams tomorrow morning" is a query a kNN search should answer; "appointments where Dr. Admin clicked save" is structured-filter territory.
+2. **Audit metadata has no semantic-search use case worth diluting the embedding corpus for.** Creator/changedBy UUIDs are opaque strings that wouldn't usefully participate in embedding similarity. Even creator/changedBy display names would mostly add noise — the meaningful clinical descriptor is the provider, not the back-office user who entered the record.
+3. **The multi-valued provider surface is filter-only by design** ([Decision 4](#decision-4-multi-provider-arrays-alongside-cross-cutting-single-provider-fields)). The primary provider is in text for the common single-provider case; the full set is reachable via the parallel arrays.
+
+### Consequences
+- Free-text search like "appointments created by Dr. Admin" doesn't work. The same query expressed as `creator_uuid:<admin-uuid>` does work. Consumers and dashboards must use the right surface per query shape.
+- Multi-provider appointments are still discoverable in text via the primary provider — but the secondary providers are not. Consumers searching for "appointments with Dr. C" where C is a secondary provider must use `provider_uuids` or `provider_names`, not the embedded text.
+- The full recurring structure is filter-only. Free-text search "weekly Monday recurring" doesn't match a non-recurring appointment but also won't match a weekly Monday recurring appointment unless the consumer's search backend interprets the `is_recurring`-derived "Recurring" token. Structured queries are the right surface.
+
+---
+
+## Decision 15: `DOC_ZONE` = JVM-default timezone, captured at class load
+
+### Status
+Accepted (with deployment-time caveat).
+
+### Context
+The `date` cross-cutting field is a `LocalDate`. Projecting a UTC `Instant` (the underlying `Date.toInstant()`) onto a calendar date requires picking a timezone. Three options:
+
+| Option | Behavior |
+|---|---|
+| `ZoneId.systemDefault()` at class load | Calendar boundaries match the JVM's local time; consistent with the rest of the module |
+| `ZoneOffset.UTC` | Calendar boundaries are UTC midnight; deployment-independent but shifted from local clinical time for non-UTC deployments |
+| Read from a module property | Deployment-configurable but adds an operational knob |
+
+The choice is load-bearing because date-range queries (`date:2026-06-01`) return different result sets depending on which day a given clinical Instant falls onto.
+
+### Decision
+```java
+private static final ZoneId DOC_ZONE = ZoneId.systemDefault();
+```
+
+Captured once at class load. Applied to both the `date` field projection and the human-readable date/time substrings in `text`.
+
+### Rationale
+1. **Consistent with the rest of the appointments module.** Every other `Date.toLocalDate()`-equivalent operation in the module already uses JVM-default. A consumer reading "today's appointments" gets the same calendar interpretation as the module's existing reporting surfaces.
+2. **Most deployments are single-timezone.** A deployment running in IST sees IST-aligned calendar boundaries; a deployment running in EST sees EST-aligned. The clinical user expects local-time semantics.
+3. **UTC was rejected because it offsets boundaries by hours.** An appointment scheduled for 2026-06-01 23:00 IST (= 17:30 UTC) would land on `date:2026-06-01` under JVM-default-IST but `date:2026-06-01` under UTC also — but an appointment scheduled for 2026-06-01 06:00 IST (= 00:30 UTC) lands on `date:2026-06-01` under IST and `date:2026-06-01` under UTC. The boundary cases differ. Local-time alignment is more intuitive for the IST-zoned deployments that drive this module's primary usage (Bahmni distributions, primarily Indian healthcare).
+4. **A configured property was rejected because the operational cost outweighs the gain.** A deployment that genuinely needs UTC can set the JVM `user.timezone` system property (the module already does this for test runs); a dedicated module property would add a knob with no clear consumer.
+
+### Consequences
+- A multi-region deployment (extremely rare for the appointments module) where different OpenMRS nodes run in different JVM time zones would project the same clinical Instant onto different `LocalDate` values per node. Cross-node date-range queries against the same shared backend would surface inconsistent results.
+- The capture is at class load. Subsequent changes to `TimeZone.setDefault(...)` at runtime do not affect the serializer's behaviour. The module's test harness sets `user.timezone=Asia/Kolkata` via Maven `argLine`, locking the test-time projection.
+- A deployment that wants UTC must set `-Duser.timezone=UTC` at JVM startup. Documented in the class Javadoc.
 
 ---
 
