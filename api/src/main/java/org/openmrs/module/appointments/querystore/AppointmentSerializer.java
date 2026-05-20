@@ -44,8 +44,10 @@ import java.util.Set;
  *   <li>{@code appointment_number} — the human-readable identifier (e.g. {@code "APPT-001"}).</li>
  *   <li>{@code status} — passthrough of {@link AppointmentStatus#name()}; a rename of an enum
  *       constant in {@code AppointmentStatus} silently changes the wire format. Current values
- *       are {@code "Scheduled"}, {@code "Cancelled"}, {@code "CheckedIn"} (etc.); consumers
- *       must track the upstream enum.</li>
+ *       are {@code "Requested"}, {@code "Scheduled"}, {@code "CheckedIn"}, {@code "Completed"},
+ *       {@code "Cancelled"}, {@code "Missed"} — consumers building filter whitelists must
+ *       enumerate all six (and re-check the enum on each upstream upgrade), not hard-code a
+ *       subset hedged by "etc.".</li>
  *   <li>{@code appointment_kind} — passthrough of
  *       {@link org.openmrs.module.appointments.model.AppointmentKind#name()}; same upstream-enum
  *       coupling as {@code status}.</li>
@@ -60,9 +62,14 @@ import java.util.Set;
  *   <li>{@code date_created} — passthrough of {@code Date.toInstant().toString()} (same
  *       optional-milliseconds shape as {@code start_date_time}). Parallel to {@code last_modified}
  *       but specifically the create-event timestamp.</li>
- *   <li>{@code related_appointment_uuid} — when the appointment was created by
- *       {@code AppointmentsService.reschedule()}, this is the UUID of the prior (now-cancelled)
- *       appointment so consumers can traverse the rescheduling chain.</li>
+ *   <li>{@code related_appointment_uuid} — UUID of the predecessor appointment when the current
+ *       appointment was produced by a single-occurrence edit of a recurring pattern (see
+ *       {@code SingleAppointmentRecurringPatternUpdateService}: the prior occurrence is voided
+ *       and the new occurrence carries this link back). <b>Not</b> populated by
+ *       {@code AppointmentsService.reschedule()} — that path cancels the prior appointment and
+ *       saves the new one without any back-link. Consumers querying for "all rescheduled
+ *       appointments" via {@code related_appointment_uuid IS NOT NULL} will surface only the
+ *       recurring-pattern single-edit case, not reschedule-flow records.</li>
  *   <li>{@code comments} — free-text appointment note.</li>
  *   <li>{@code teleconsultation_link} — meeting URL when set.</li>
  *   <li>{@code is_recurring} — emitted only when {@code true} (sparse; absence means "not recurring").</li>
@@ -91,12 +98,15 @@ import java.util.Set;
  *       {@code <response>} suffix is a passthrough of
  *       {@link org.openmrs.module.appointments.model.AppointmentProviderResponse#name()}, so a
  *       rename of an enum constant silently changes the wire format (same upstream-enum coupling
- *       as {@code status}). Current values are {@code ACCEPTED}, {@code REJECTED},
- *       {@code AWAITING}. Providers with a {@code null} response are <b>omitted entirely</b>
- *       from this array — consumers derive "awaiting response" as the set difference between
- *       {@code provider_uuids} and the UUIDs in {@code provider_responses}. The flat-string
- *       encoding (vs. nested objects) is intentional: not every querystore backend indexes
- *       nested objects uniformly.</li>
+ *       as {@code status}). Current values are {@code AWAITING}, {@code ACCEPTED},
+ *       {@code REJECTED}, {@code TENTATIVE}, {@code CANCELLED} — consumers building filter
+ *       whitelists must enumerate all five (and re-check the enum on each upstream upgrade), not
+ *       hard-code a subset. Providers with a {@code null} response are <b>omitted entirely</b>
+ *       from this array — consumers derive "no response recorded yet" as the set difference
+ *       between {@code provider_uuids} and the UUIDs in {@code provider_responses}; this is
+ *       distinct from the explicit {@code AWAITING} enum value, which is recorded when the
+ *       provider was asked but hasn't yet responded. The flat-string encoding (vs. nested
+ *       objects) is intentional: not every querystore backend indexes nested objects uniformly.</li>
  * </ul>
  */
 public class AppointmentSerializer implements ClinicalRecordSerializer<Appointment> {
@@ -179,9 +189,10 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 			doc.putMetadata("provider_uuids", providerUuids);
 			doc.putMetadata("provider_names", providerNames);
 
-			// Per-provider response (ACCEPTED / REJECTED / AWAITING) is what the
-			// updateAppointmentProviderResponse trigger surface mutates. Surfacing it as a
-			// UUID→response array lets consumers query "appointments where Dr. X has declined."
+			// Per-provider response (AWAITING / ACCEPTED / REJECTED / TENTATIVE / CANCELLED — see
+			// the class Javadoc) is what the updateAppointmentProviderResponse trigger surface
+			// mutates. Surfacing it as a UUID→response array lets consumers query "appointments
+			// where Dr. X has declined."
 			List<String> providerResponses = collectProviderResponses(appointment);
 			if (!providerResponses.isEmpty()) {
 				doc.putMetadata("provider_responses", providerResponses);
@@ -245,9 +256,10 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 		if (appointment.getDateCreated() != null) {
 			doc.putMetadata("date_created", appointment.getDateCreated().toInstant().toString());
 		}
-		// Rescheduling chain — when the appointment was created by reschedule(), it links back to
-		// the previous (now-cancelled) appointment via this field. Surface the UUID so a consumer
-		// can traverse the chain without querying core.
+		// Recurring single-edit predecessor — populated when SingleAppointmentRecurringPatternUpdateService
+		// produces a new occurrence by voiding the prior one and linking the new one back via
+		// setRelatedAppointment. NOT populated by AppointmentsService.reschedule(); see the class
+		// Javadoc for the full setter-path map and the consumer-query implications.
 		if (appointment.getRelatedAppointment() != null) {
 			doc.putMetadata("related_appointment_uuid", appointment.getRelatedAppointment().getUuid());
 		}
@@ -371,11 +383,13 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 	}
 
 	/**
-	 * Collects each provider's response (ACCEPTED / REJECTED / AWAITING) keyed by the provider's
-	 * UUID. Format: {@code "<provider-uuid>:<response>"} per entry so the metadata reads as a
-	 * flat array of opaque strings rather than requiring nested-object indexing — the latter is
-	 * not uniformly supported across querystore's three reference backends. A null response is
-	 * skipped (some providers haven't been asked yet) rather than encoded as the string "null".
+	 * Collects each provider's response (any value of
+	 * {@link org.openmrs.module.appointments.model.AppointmentProviderResponse}) keyed by the
+	 * provider's UUID. Format: {@code "<provider-uuid>:<response>"} per entry so the metadata
+	 * reads as a flat array of opaque strings rather than requiring nested-object indexing — the
+	 * latter is not uniformly supported across querystore's three reference backends. A null
+	 * response is skipped (some providers haven't been asked yet) rather than encoded as the
+	 * string "null"; this absence is distinct from the explicit {@code AWAITING} enum value.
 	 */
 	private List<String> collectProviderResponses(Appointment appointment) {
 		Set<AppointmentProvider> providers = appointment.getProviders();

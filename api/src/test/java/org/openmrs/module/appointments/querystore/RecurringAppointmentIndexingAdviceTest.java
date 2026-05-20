@@ -190,6 +190,44 @@ public class RecurringAppointmentIndexingAdviceTest {
 	}
 
 	@Test
+	public void indexerLinkageErrorOnFirstAppointmentDoesNotStarveSiblings() throws Exception {
+		// Same sibling-isolation contract as the RuntimeException variant, but with the version-
+		// skew failure mode the outer catch was widened for. Without inner-loop LinkageError
+		// handling, a NoSuchMethodError from indexer.index(...) on the first appointment unwinds
+		// the dispatched lambda and skips every subsequent sibling — defeating the inner
+		// per-document try/catch's promise that one poison row can't starve the rest.
+		Appointment poison = appointment("poison-uuid");
+		Appointment survivor = appointment("survivor-uuid");
+		AppointmentRecurringPattern pattern = patternOf(poison, survivor);
+		org.mockito.Mockito.doThrow(new NoSuchMethodError("BridgeIndexer.index"))
+				.doNothing()
+				.when(indexer).index(any(QueryDocument.class));
+
+		advice.afterReturning(pattern, methodNamed("validateAndSave"), new Object[] { pattern }, null);
+
+		verify(indexer, times(2)).index(any(QueryDocument.class));
+	}
+
+	@Test
+	public void indexerDeleteLinkageErrorOnFirstVoidedDoesNotStarveSiblings() throws Exception {
+		// Parallel LinkageError variant for the delete branch. Without inner-loop LinkageError
+		// handling, a NoSuchMethodError from indexer.delete(...) on the first voided appointment
+		// leaves clinically-cancelled subsequent siblings stranded in querystore.
+		Appointment poison = appointment("poison-voided");
+		poison.setVoided(true);
+		Appointment survivor = appointment("survivor-voided");
+		survivor.setVoided(true);
+		AppointmentRecurringPattern pattern = patternOf(poison, survivor);
+		org.mockito.Mockito.doThrow(new NoSuchMethodError("BridgeIndexer.delete"))
+				.doNothing()
+				.when(indexer).delete(eq("appointments_appointment"), any(String.class));
+
+		advice.afterReturning(pattern, methodNamed("validateAndSave"), new Object[] { pattern }, null);
+
+		verify(indexer, times(2)).delete(eq("appointments_appointment"), any(String.class));
+	}
+
+	@Test
 	public void indexerDeleteRuntimeExceptionOnFirstVoidedDoesNotStarveSiblings() throws Exception {
 		// Parallel sibling-isolation contract for the delete branch of dispatch(): two voided
 		// appointments, the first throws on delete, the second must still reach indexer.delete().

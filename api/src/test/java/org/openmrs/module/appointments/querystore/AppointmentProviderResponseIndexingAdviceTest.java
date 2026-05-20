@@ -175,6 +175,23 @@ public class AppointmentProviderResponseIndexingAdviceTest {
 	}
 
 	@Test
+	public void indexerLinkageErrorDoesNotPropagateToCaller() throws Exception {
+		// Pins the inner-catch LinkageError handling for the dispatched lambda. A version-skewed
+		// querystore (renamed BridgeIndexer.index → NoSuchMethodError) thrown inside the after-
+		// commit lambda would otherwise unwind to the dispatcher's error-handling path while the
+		// document is silently unindexed; the widened inner catch ensures the failure is logged
+		// at the bridge's per-document granularity instead.
+		AppointmentProvider providerWithResponse = providerWith(appointment("appt-uuid"));
+		doThrow(new NoSuchMethodError("BridgeIndexer.index"))
+				.when(indexer).index(any(QueryDocument.class));
+
+		advice.afterReturning(null, methodNamed("updateAppointmentProviderResponse"),
+				new Object[] { providerWithResponse }, null);
+
+		verify(indexer, times(1)).index(any(QueryDocument.class));
+	}
+
+	@Test
 	public void indexerRuntimeExceptionDoesNotPropagateToCaller() throws Exception {
 		AppointmentProvider providerWithResponse = providerWith(appointment("appt-uuid"));
 		// Verifies the inner per-document catch in dispatch(): a single poison row must not

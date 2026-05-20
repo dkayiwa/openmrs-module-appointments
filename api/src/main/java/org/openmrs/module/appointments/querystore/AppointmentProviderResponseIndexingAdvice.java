@@ -91,7 +91,11 @@ public class AppointmentProviderResponseIndexingAdvice implements AfterReturning
 					indexer.index(doc);
 				}
 			}
-			catch (RuntimeException e) {
+			catch (RuntimeException | LinkageError e) {
+				// Mirrors the outer catch's LinkageError-handling so a version-skewed querystore
+				// (renamed BridgeIndexer method → NoSuchMethodError thrown from the dispatched
+				// lambda after commit) doesn't leak out of the lambda into the dispatcher's
+				// error-handling path while leaving the corresponding document silently unindexed.
 				log.warn("Bridge skipping " + (voided ? "delete" : "index") + " for " + resourceType
 						+ "/" + uuid + " due to failure", e);
 			}

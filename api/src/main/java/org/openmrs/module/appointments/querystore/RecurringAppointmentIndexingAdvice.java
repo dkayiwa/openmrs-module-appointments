@@ -169,7 +169,7 @@ public class RecurringAppointmentIndexingAdvice implements AfterReturningAdvice 
 				try {
 					indexer.index(doc);
 				}
-				catch (RuntimeException e) {
+				catch (RuntimeException | LinkageError e) {
 					log.warn("Bridge skipping index for " + resourceType + "/" + doc.getResourceUuid()
 							+ " due to failure", e);
 				}
@@ -178,7 +178,7 @@ public class RecurringAppointmentIndexingAdvice implements AfterReturningAdvice 
 				try {
 					indexer.delete(resourceType, uuid);
 				}
-				catch (RuntimeException e) {
+				catch (RuntimeException | LinkageError e) {
 					log.warn("Bridge skipping delete for " + resourceType + "/" + uuid
 							+ " due to failure", e);
 				}
