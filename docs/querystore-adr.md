@@ -31,7 +31,8 @@ This module's contribution is a single resource type, `appointments_appointment`
 13. [Cross-cutting `date` field = `startDateTime`](#decision-13-cross-cutting-date-field--startdatetime)
 14. [`text` chunk composition: clinical prose only, no audit metadata](#decision-14-text-chunk-composition-clinical-prose-only-no-audit-metadata)
 15. [`DOC_ZONE` = JVM-default timezone, captured at class load](#decision-15-doc_zone--jvm-default-timezone-captured-at-class-load)
-16. [Open questions](#open-questions)
+16. [Bean discovery via `Context.getRegisteredComponent`, not Spring `@Autowired`](#decision-16-bean-discovery-via-contextgetregisteredcomponent-not-spring-autowired)
+17. [Open questions](#open-questions)
 
 ---
 
@@ -506,6 +507,43 @@ Captured once at class load. Applied to both the `date` field projection and the
 - A multi-region deployment (extremely rare for the appointments module) where different OpenMRS nodes run in different JVM time zones would project the same clinical Instant onto different `LocalDate` values per node. Cross-node date-range queries against the same shared backend would surface inconsistent results.
 - The capture is at class load. Subsequent changes to `TimeZone.setDefault(...)` at runtime do not affect the serializer's behaviour. The module's test harness sets `user.timezone=Asia/Kolkata` via Maven `argLine`, locking the test-time projection.
 - A deployment that wants UTC must set `-Duser.timezone=UTC` at JVM startup. Documented in the class Javadoc.
+
+---
+
+## Decision 16: Bean discovery via `Context.getRegisteredComponent`, not Spring `@Autowired`
+
+### Status
+Accepted (forced by OpenMRS's AOP wiring lifecycle).
+
+### Context
+The three advice classes need three dependencies each on every fire: the `AppointmentSerializer` Spring bean (for projection), the `querystore.bridge.indexer` bean (for upsert/delete), and the `querystore.bridge.dispatcher` bean (for after-commit scheduling). The "obvious" pattern would be Spring constructor injection or `@Autowired` fields. The slice does neither — every dependency is resolved on each `afterReturning` invocation via `Context.getRegisteredComponent(beanId, ExpectedType.class)`.
+
+The non-obvious constraint: OpenMRS's `<advice>` mechanism in `config.xml` is interpreted by the OpenMRS module loader, not by Spring. The module loader instantiates the advice class via its no-arg constructor at module-load time, *before* the module's Spring context is refreshed. There is no Spring proxy around the advice instance and no Spring lifecycle hook to inject collaborators into it. A field annotated `@Autowired` would stay null.
+
+### Decision
+Every dependency lookup in the three advice classes goes through `Context.getRegisteredComponent(...)`. Each lookup is performed inside the method body (e.g. `dispatch()`) on every invocation rather than cached on the instance:
+
+```java
+AppointmentSerializer serializer = Context.getRegisteredComponent(
+        AppointmentIndexingAdvice.SERIALIZER_BEAN_ID, AppointmentSerializer.class);
+BridgeIndexer indexer = Context.getRegisteredComponent(
+        BRIDGE_INDEXER_BEAN_ID, BridgeIndexer.class);
+AfterCommitDispatcher dispatcher = Context.getRegisteredComponent(
+        BRIDGE_DISPATCHER_BEAN_ID, AfterCommitDispatcher.class);
+```
+
+The serializer bean ID is captured as a package-visible constant (`AppointmentIndexingAdvice.SERIALIZER_BEAN_ID`); the bridge bean IDs are captured as constants on `RecurringAppointmentIndexingAdvice` and reused by the sibling advice. Constants exist so the test fixtures and production lookups agree.
+
+### Rationale
+1. **`@Autowired` does not work for `<advice>`-wired classes.** The module loader instantiates them outside Spring's bean lifecycle. A `@Autowired AppointmentSerializer serializer` field would compile, the module would load, and the field would stay null forever. The first advice fire would NPE — caught by the outer swallow per [Decision 11](#decision-11-linkageerror-catch-widening-for-version-skew-tolerance) and logged at warn level, with the result that every appointment write silently bypasses querystore.
+2. **Per-invocation lookup costs are negligible.** `Context.getRegisteredComponent` is a HashMap lookup; the cost is dwarfed by the surrounding serialize → embed → upsert work. Caching the result on the advice instance would save ~3 hash lookups per write at the cost of a thread-safety concern (the advice is shared across threads).
+3. **Querystore's own `AbstractIndexingAdvice` uses the same pattern for its `indexer()` / `dispatcher()` methods.** This isn't a slice-level invention; it's the convention OpenMRS modules use for AOP-advice dependencies.
+4. **Bean-ID constants over string literals** so a future bean rename in `moduleApplicationContext.xml` propagates to the test fixtures and back. A magic string in two places drifts; a constant in two places doesn't.
+
+### Consequences
+- A future contributor seeing the per-invocation lookups and "simplifying" to `@Autowired` would break the module silently. The pattern is documented here so the next maintainer reads the constraint before the refactor.
+- A rename of any of the three bean IDs (`appointments.serializer.appointment`, `querystore.bridge.indexer`, `querystore.bridge.dispatcher`) is a coordinated change across `moduleApplicationContext.xml`, the constant definitions, and the test fixtures. The tests stub `Context.getRegisteredComponent` via `MockedStatic<Context>` referencing the same constants, so the rename surfaces at test time rather than at production fire-time.
+- Querystore's own `<bean id="querystore.bridge.indexer">` and `<bean id="querystore.bridge.dispatcher">` IDs are part of its de-facto public SPI. A rename upstream is a breaking change; this module's `<require_module>` declaration (see [Decision 7](#decision-7-require_module-querystore-no-version-pin-while-snapshot)) plus the `LinkageError` catch widening (see [Decision 11](#decision-11-linkageerror-catch-widening-for-version-skew-tolerance)) form the safety net.
 
 ---
 
