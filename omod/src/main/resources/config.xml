@@ -13,8 +13,9 @@
 
 	<require_modules>
 		<require_module>org.openmrs.module.webservices.rest</require_module>
+		<require_module>org.openmrs.module.querystore</require_module>
 	</require_modules>
-	
+
 	<aware_of_modules>
 	    <aware_of_module version="${openmrsAtomfeedVersion}">org.ict4h.openmrs.openmrs-atomfeed</aware_of_module>
 	</aware_of_modules>
@@ -45,6 +46,23 @@
 		<file>messages_es.properties</file>
 	</messages>
 	<!-- /Internationalization -->
+
+	<!-- Querystore indexing bridge (ADR Decision 13). Dispatches Appointment saves and
+	     status changes into the querystore pipeline; sibling of the Atomfeed advice below. -->
+	<advice>
+		<point>org.openmrs.module.appointments.service.AppointmentsService</point>
+		<class>org.openmrs.module.appointments.querystore.AppointmentIndexingAdvice</class>
+	</advice>
+
+	<advice>
+		<point>org.openmrs.module.appointments.service.AppointmentRecurringPatternService</point>
+		<class>org.openmrs.module.appointments.querystore.RecurringAppointmentIndexingAdvice</class>
+	</advice>
+
+	<advice>
+		<point>org.openmrs.module.appointments.service.AppointmentsService</point>
+		<class>org.openmrs.module.appointments.querystore.AppointmentProviderResponseIndexingAdvice</class>
+	</advice>
 
 	<advice>
 		<point>org.openmrs.module.appointments.service.AppointmentServiceDefinitionService</point>
