@@ -163,14 +163,25 @@ public class AppointmentSerializerTest {
 		assertEquals(APPOINTMENT_UUID, doc.getResourceUuid());
 		assertEquals(PATIENT_UUID, doc.getPatientUuid());
 		assertNotNull(doc.getText());
-		assertNull(doc.getMetadata().get("provider_uuid"));
-		assertNull(doc.getMetadata().get("location_uuid"));
-		assertNull(doc.getMetadata().get("appointment_service_uuid"));
-		assertNull(doc.getMetadata().get("appointment_service_type_uuid"));
-		assertNull(doc.getMetadata().get("teleconsultation_link"));
-		assertNull(doc.getMetadata().get("comments"));
+		// Use containsKey (not get == null) so a regression that emits putMetadata("k", null) —
+		// present-but-null — is caught: a consumer's "IS NOT NULL" / "containsKey" filter would
+		// then misclassify provider-less appointments as having a (null) provider while
+		// get == null stayed green.
+		assertFalse(doc.getMetadata().containsKey("provider_uuid"));
+		assertFalse(doc.getMetadata().containsKey("location_uuid"));
+		assertFalse(doc.getMetadata().containsKey("appointment_service_uuid"));
+		assertFalse(doc.getMetadata().containsKey("appointment_service_type_uuid"));
+		assertFalse(doc.getMetadata().containsKey("teleconsultation_link"));
+		assertFalse(doc.getMetadata().containsKey("comments"));
 		// is_recurring is emitted only when true (sparse-when-false convention).
-		assertNull(doc.getMetadata().get("is_recurring"));
+		assertFalse(doc.getMetadata().containsKey("is_recurring"));
+
+		// The `text` chunk for an appointment with no optional fields must contain none of the
+		// buildText connecting tokens for null entities — guards against a regression that
+		// removes the `&& getX() != null` from any buildText branch and emits literal `null`.
+		String text = doc.getText();
+		assertFalse("text must not contain literal 'null' substring on a minimal appointment",
+				text.contains("null"));
 	}
 
 	@Test
@@ -182,9 +193,125 @@ public class AppointmentSerializerTest {
 
 		// Appointment.provider (the singular Java field) is intentionally not Hibernate-mapped,
 		// so persisted appointments never populate it — the serializer correctly emits no
-		// provider_uuid / provider_name when the providers Set is empty.
-		assertNull(doc.getMetadata().get("provider_uuid"));
-		assertNull(doc.getMetadata().get("provider_name"));
+		// provider_uuid / provider_name when the providers Set is empty. Use containsKey so a
+		// regression emitting putMetadata("provider_uuid", null) stays caught.
+		assertFalse(doc.getMetadata().containsKey("provider_uuid"));
+		assertFalse(doc.getMetadata().containsKey("provider_name"));
+	}
+
+	@Test
+	public void omitsNameFieldsWhenLocationServiceOrTypeNameIsNull() {
+		Appointment appointment = newAppointment();
+		// All three entities present but with null names — a transient/incomplete state the model
+		// doesn't constrain against. Without the omit-on-null guards, the metadata map carries
+		// present-but-null entries while `buildText` (which guards) omits them entirely, breaking
+		// the contract that structured and free-text searches agree on which appointments
+		// reference a named location / service / type.
+		Location location = new Location();
+		location.setUuid("loc-uuid");
+		// no name set
+		appointment.setLocation(location);
+
+		AppointmentServiceDefinition service = new AppointmentServiceDefinition();
+		service.setUuid("svc-uuid");
+		// no name set
+		appointment.setService(service);
+
+		AppointmentServiceType serviceType = new AppointmentServiceType();
+		serviceType.setUuid("svctype-uuid");
+		// no name set
+		appointment.setServiceType(serviceType);
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		// UUIDs are still emitted — the entities are present even if their display label isn't.
+		assertEquals("loc-uuid", doc.getMetadata().get("location_uuid"));
+		assertEquals("svc-uuid", doc.getMetadata().get("appointment_service_uuid"));
+		assertEquals("svctype-uuid", doc.getMetadata().get("appointment_service_type_uuid"));
+
+		// Name fields must be absent (not present-but-null) so a consumer's
+		// "location_name IS NOT NULL" filter correctly excludes these appointments.
+		assertFalse("location_name must not be in the metadata map when Location.name is null",
+				doc.getMetadata().containsKey("location_name"));
+		assertFalse("appointment_service_name must not be in the metadata map when name is null",
+				doc.getMetadata().containsKey("appointment_service_name"));
+		assertFalse("appointment_service_type_name must not be in the metadata map when name is null",
+				doc.getMetadata().containsKey("appointment_service_type_name"));
+
+		// The `text` chunk's null-guards in buildText must also hold — otherwise a regression
+		// that removes `&& getName() != null` from the buildText conditionals would emit literal
+		// "null" tokens into the searchable text while this test (which only checks metadata)
+		// stayed green. Asserting absence of the connecting prepositions catches that drift.
+		String text = doc.getText();
+		assertFalse("text must not contain ' for null' when service name is null",
+				text.contains(" for null"));
+		assertFalse("text must not contain ' (null)' when service-type name is null",
+				text.contains(" (null)"));
+		assertFalse("text must not contain ' at null' when location name is null",
+				text.contains(" at null"));
+		// Generic safety net: no "null" substring should appear in a chunk built entirely from
+		// null-named entities — covers any future buildText fragment that forgets the guard.
+		assertFalse("text must not contain a literal 'null' substring for any null-named entity",
+				text.contains("null"));
+	}
+
+	@Test
+	public void emitsOnlyApplicableRecurringFieldsForDayTypePattern() {
+		Appointment appointment = newAppointment();
+		// DAY-type ad-hoc pattern: type + period + frequency, but no daysOfWeek and no endDate.
+		// The conditional-emit guards in the serializer must keep recurring_days_of_week and
+		// recurring_end_date out of the metadata map entirely (not present-but-null), because a
+		// querystore consumer doing "recurring_end_date IS NOT NULL" would otherwise misclassify
+		// open-ended DAY patterns as bounded.
+		AppointmentRecurringPattern pattern = new AppointmentRecurringPattern();
+		pattern.setType(RecurringAppointmentType.DAY);
+		pattern.setPeriod(1);
+		pattern.setFrequency(5);
+		appointment.setAppointmentRecurringPattern(pattern);
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		assertEquals(Boolean.TRUE, doc.getMetadata().get("is_recurring"));
+		assertEquals("DAY", doc.getMetadata().get("recurring_type"));
+		assertEquals(1, doc.getMetadata().get("recurring_period"));
+		assertEquals(5, doc.getMetadata().get("recurring_frequency"));
+		assertFalse("daysOfWeek must not be in the metadata map at all for DAY patterns",
+				doc.getMetadata().containsKey("recurring_days_of_week"));
+		assertFalse("endDate must not be in the metadata map at all for open-ended patterns",
+				doc.getMetadata().containsKey("recurring_end_date"));
+		// The `text` chunk must mention recurrence so a free-text search agrees with the
+		// structured surface. Without this, a regression that gates the buildText "Recurring."
+		// token on type==WEEK would silently desync free-text and structured search for DAY
+		// patterns.
+		assertTrue("text chunk must mention recurrence for any non-null pattern",
+				doc.getText().contains("Recurring"));
+	}
+
+	@Test
+	public void fallsBackToProviderUuidWhenProviderNameIsNull() {
+		Appointment appointment = newAppointment();
+		// Provider with no linked Person — Provider.getName() returns null in this state.
+		// Without the fallback in the serializer, provider_names would contain a literal null
+		// which a JSON-rendering backend serialises as ["Dr. Alpha", null, ...], producing a
+		// list entry no consumer can reconcile back to any user.
+		Provider namelessProvider = new Provider();
+		namelessProvider.setUuid("nameless-uuid");
+		AppointmentProvider ap = new AppointmentProvider();
+		ap.setProvider(namelessProvider);
+		appointment.setProviders(new LinkedHashSet<>(Collections.singletonList(ap)));
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		List<?> providerNames = (List<?>) doc.getMetadata().get("provider_names");
+		assertEquals(1, providerNames.size());
+		assertEquals("provider_names must not contain literal null; UUID is the fallback",
+				"nameless-uuid", providerNames.get(0));
+		// Singular provider_name (cross-cutting) follows the same arrays — verify it is non-null.
+		assertNotNull(doc.getMetadata().get("provider_name"));
+		// The free-text `text` chunk must mention the same fallback so a free-text search and a
+		// structured search agree on which appointments reference this provider.
+		assertTrue("text chunk must include the provider UUID when name is null",
+				doc.getText().contains("nameless-uuid"));
 	}
 
 	@Test
@@ -252,7 +379,7 @@ public class AppointmentSerializerTest {
 		// LinkedHashSet preserves insertion order so the test is deterministic; production
 		// behaviour depends on the Hibernate-returned set's iteration order, but the assertion here
 		// is that we deterministically return some non-null provider in a multi-provider scenario.
-		Set<AppointmentProvider> providers = new java.util.LinkedHashSet<>();
+		Set<AppointmentProvider> providers = new LinkedHashSet<>();
 		providers.add(apOne);
 		providers.add(apTwo);
 		appointment.setProviders(providers);
@@ -313,7 +440,7 @@ public class AppointmentSerializerTest {
 
 		QueryDocument doc = serializer.serialize(appointment);
 
-		assertNull(doc.getMetadata().get("teleconsultation_link"));
+		assertFalse(doc.getMetadata().containsKey("teleconsultation_link"));
 		assertFalse(doc.getText().contains("Teleconsultation"));
 	}
 
