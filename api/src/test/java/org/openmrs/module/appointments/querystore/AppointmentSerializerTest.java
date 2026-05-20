@@ -426,6 +426,51 @@ public class AppointmentSerializerTest {
 	}
 
 	@Test
+	public void usesStartDateTimeAsLastModifiedFallbackWhenAuditDatesMissing() {
+		// Legacy or test-seeded appointment missing both audit columns but with startDateTime set.
+		// Without the third tier of the fallback chain, querystore's conditional-upsert race guard
+		// (ADR Decision 3) has no version timestamp for these records and falls back to
+		// last-write-wins — under concurrent indexing, the freshest projection can lose to a
+		// slower bootstrap scan and the document goes stale silently.
+		Appointment appointment = new Appointment();
+		appointment.setUuid(APPOINTMENT_UUID);
+		Patient patient = new Patient();
+		patient.setUuid(PATIENT_UUID);
+		appointment.setPatient(patient);
+		Date startDateTime = utcDate(2026, Calendar.JUNE, 1, 10, 0, 0);
+		appointment.setStartDateTime(startDateTime);
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		assertNotNull("falls back to startDateTime when both audit dates are null",
+				doc.getLastModified());
+		assertEquals(startDateTime.toInstant(), doc.getLastModified());
+	}
+
+	@Test
+	public void fallsBackFromStartDateTimeToLastModifiedForClinicalDate() {
+		// Appointment with audit dates but no startDateTime — doc.date must fall back to
+		// lastModifiedDate so cross-tier wildcard date-range queries don't silently miss the
+		// record. Without this fallback, legacy appointments without start times would be
+		// undiscoverable via "date IN [range]" searches even when last_modified is in range.
+		Appointment appointment = new Appointment();
+		appointment.setUuid(APPOINTMENT_UUID);
+		Patient patient = new Patient();
+		patient.setUuid(PATIENT_UUID);
+		appointment.setPatient(patient);
+		Date changed = utcDate(2026, Calendar.JANUARY, 11, 9, 0, 0);
+		appointment.setDateChanged(changed);
+		// No startDateTime.
+
+		QueryDocument doc = serializer.serialize(appointment);
+
+		assertNotNull("doc.date falls back to lastModified when startDateTime is null",
+				doc.getDate());
+		assertEquals(changed.toInstant().atZone(java.time.ZoneId.systemDefault()).toLocalDate(),
+				doc.getDate());
+	}
+
+	@Test
 	public void leavesEmbeddingUnsetSoQueryStorePopulatesIt() {
 		Appointment appointment = newAppointment();
 		QueryDocument doc = serializer.serialize(appointment);

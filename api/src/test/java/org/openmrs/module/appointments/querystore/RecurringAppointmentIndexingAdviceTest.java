@@ -160,18 +160,59 @@ public class RecurringAppointmentIndexingAdviceTest {
 	}
 
 	@Test
-	public void indexerRuntimeExceptionDoesNotPropagateToCaller() throws Exception {
-		Appointment one = appointment("uuid-1");
-		AppointmentRecurringPattern pattern = patternOf(one);
-		doThrow(new RuntimeException("indexer down")).when(indexer).index(any(QueryDocument.class));
+	public void indexerRuntimeExceptionOnFirstAppointmentDoesNotStarveSiblings() throws Exception {
+		// Two-appointment fixture: the indexer throws on the first, the second must still be
+		// indexed. Without this sibling-isolation assertion, a "simplify" refactor that hoists
+		// the per-document try/catch in dispatch() into a single outer try-around-the-loop would
+		// regress to "first poison row aborts every subsequent appointment in the same save," and
+		// a single-appointment test would stay green while real recurring saves silently lost
+		// every appointment after the first failure.
+		Appointment poison = appointment("poison-uuid");
+		Appointment survivor = appointment("survivor-uuid");
+		AppointmentRecurringPattern pattern = patternOf(poison, survivor);
 
-		// Verifies the inner per-document catch in dispatch(): a single poison row must not
-		// propagate back to the clinical-thread caller, whose transaction has already committed.
+		// Throw only on the first index call; subsequent calls succeed. doThrow().doNothing()
+		// chains the per-invocation outcomes — Mockito applies them in order.
+		org.mockito.Mockito.doThrow(new RuntimeException("indexer down"))
+				.doNothing()
+				.when(indexer).index(any(QueryDocument.class));
+
 		advice.afterReturning(pattern, methodNamed("validateAndSave"), new Object[] { pattern }, null);
 
-		// Anchor that the indexer was actually reached; without this, a future refactor that
-		// short-circuits dispatch before the per-document loop would silently keep this test green.
-		verify(indexer, times(1)).index(any(QueryDocument.class));
+		// Both appointments reached the indexer — sibling isolation holds.
+		ArgumentCaptor<QueryDocument> captor = ArgumentCaptor.forClass(QueryDocument.class);
+		verify(indexer, times(2)).index(captor.capture());
+		java.util.Set<String> indexed = new HashSet<>();
+		for (QueryDocument doc : captor.getAllValues()) {
+			indexed.add(doc.getResourceUuid());
+		}
+		assertEquals(new HashSet<>(java.util.Arrays.asList("poison-uuid", "survivor-uuid")), indexed);
+	}
+
+	@Test
+	public void indexerDeleteRuntimeExceptionOnFirstVoidedDoesNotStarveSiblings() throws Exception {
+		// Parallel sibling-isolation contract for the delete branch of dispatch(): two voided
+		// appointments, the first throws on delete, the second must still reach indexer.delete().
+		// Without this, a refactor that hoists the per-delete try/catch into a single outer try
+		// would silently regress to "first poison delete aborts every subsequent voided sibling,"
+		// leaving stale documents in querystore for clinically-cancelled appointments — the
+		// existing single-voided test (voidedAppointmentRoutesToDeleteNotIndex) would stay green
+		// while real multi-occurrence cancellations leak.
+		Appointment poison = appointment("poison-voided");
+		poison.setVoided(true);
+		Appointment survivor = appointment("survivor-voided");
+		survivor.setVoided(true);
+		AppointmentRecurringPattern pattern = patternOf(poison, survivor);
+
+		org.mockito.Mockito.doThrow(new RuntimeException("delete down"))
+				.doNothing()
+				.when(indexer).delete(eq("appointments_appointment"), any(String.class));
+
+		advice.afterReturning(pattern, methodNamed("validateAndSave"), new Object[] { pattern }, null);
+
+		// Both voided appointments reached the indexer.delete path — sibling isolation holds.
+		verify(indexer, times(2)).delete(eq("appointments_appointment"), any(String.class));
+		verify(indexer, never()).index(any(QueryDocument.class));
 	}
 
 	@Test
