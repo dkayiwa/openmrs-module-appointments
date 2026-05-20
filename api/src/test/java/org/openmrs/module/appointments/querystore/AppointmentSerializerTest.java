@@ -67,6 +67,17 @@ public class AppointmentSerializerTest {
 		appointment.setAppointmentKind(AppointmentKind.Scheduled);
 		appointment.setComments("Patient prefers morning slots");
 		appointment.setTeleHealthVideoLink("https://meet.example.org/abc");
+
+		// Audit + rescheduling-chain fixtures.
+		org.openmrs.User creator = new org.openmrs.User();
+		creator.setUuid("creator-uuid");
+		appointment.setCreator(creator);
+		org.openmrs.User changedBy = new org.openmrs.User();
+		changedBy.setUuid("changed-by-uuid");
+		appointment.setChangedBy(changedBy);
+		Appointment previous = new Appointment();
+		previous.setUuid("prev-appt-uuid");
+		appointment.setRelatedAppointment(previous);
 		AppointmentRecurringPattern recurringPattern = new AppointmentRecurringPattern();
 		recurringPattern.setType(RecurringAppointmentType.WEEK);
 		recurringPattern.setPeriod(2);
@@ -142,6 +153,11 @@ public class AppointmentSerializerTest {
 		assertEquals(6, doc.getMetadata().get("recurring_frequency"));
 		assertEquals("MON,WED", doc.getMetadata().get("recurring_days_of_week"));
 		assertEquals("2026-08-30T00:00:00Z", doc.getMetadata().get("recurring_end_date"));
+		// Audit + rescheduling-chain surface.
+		assertEquals("creator-uuid", doc.getMetadata().get("creator_uuid"));
+		assertEquals("changed-by-uuid", doc.getMetadata().get("changed_by_uuid"));
+		assertEquals("2026-01-10T09:00:00Z", doc.getMetadata().get("date_created"));
+		assertEquals("prev-appt-uuid", doc.getMetadata().get("related_appointment_uuid"));
 		assertEquals("https://meet.example.org/abc", doc.getMetadata().get("teleconsultation_link"));
 		assertEquals("Patient prefers morning slots", doc.getMetadata().get("comments"));
 		// Multi-provider surface: the single provider in the fixture is still in the *_list fields.
@@ -175,6 +191,14 @@ public class AppointmentSerializerTest {
 		assertFalse(doc.getMetadata().containsKey("comments"));
 		// is_recurring is emitted only when true (sparse-when-false convention).
 		assertFalse(doc.getMetadata().containsKey("is_recurring"));
+		// Audit + rescheduling-chain fields must be absent when their source getters return null.
+		assertFalse(doc.getMetadata().containsKey("creator_uuid"));
+		assertFalse(doc.getMetadata().containsKey("changed_by_uuid"));
+		assertFalse(doc.getMetadata().containsKey("related_appointment_uuid"));
+		// date_created IS populated in the minimal fixture (newAppointment sets dateCreated as a
+		// last_modified fallback) — its absence would be a separate regression. Assert it's
+		// present and uses the documented passthrough form.
+		assertEquals("2026-01-10T09:00:00Z", doc.getMetadata().get("date_created"));
 
 		// The `text` chunk for an appointment with no optional fields must contain none of the
 		// buildText connecting tokens for null entities — guards against a regression that

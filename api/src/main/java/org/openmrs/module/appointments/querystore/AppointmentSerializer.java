@@ -54,6 +54,15 @@ import java.util.Set;
  *       {@code "2026-06-01T10:00:00Z"}, but a {@code Date} carrying non-zero milliseconds
  *       renders as {@code "2026-06-01T10:00:00.290Z"}. Consumers parsing these fields must
  *       accept both forms.</li>
+ *   <li>{@code creator_uuid} / {@code changed_by_uuid} — UUIDs of the {@code User} who created
+ *       or last modified the appointment. Names are not surfaced here; consumers needing the
+ *       display name should resolve via querystore's User projection or core.</li>
+ *   <li>{@code date_created} — passthrough of {@code Date.toInstant().toString()} (same
+ *       optional-milliseconds shape as {@code start_date_time}). Parallel to {@code last_modified}
+ *       but specifically the create-event timestamp.</li>
+ *   <li>{@code related_appointment_uuid} — when the appointment was created by
+ *       {@code AppointmentsService.reschedule()}, this is the UUID of the prior (now-cancelled)
+ *       appointment so consumers can traverse the rescheduling chain.</li>
  *   <li>{@code comments} — free-text appointment note.</li>
  *   <li>{@code teleconsultation_link} — meeting URL when set.</li>
  *   <li>{@code is_recurring} — emitted only when {@code true} (sparse; absence means "not recurring").</li>
@@ -221,6 +230,26 @@ public class AppointmentSerializer implements ClinicalRecordSerializer<Appointme
 		}
 		if (appointment.getEndDateTime() != null) {
 			doc.putMetadata("end_date_time", appointment.getEndDateTime().toInstant().toString());
+		}
+		// Audit surface — creator / changed_by / date_created enable "appointments created by
+		// Dr. X" / "modified by Dr. X" / "created in date range" queries without round-tripping
+		// to core. last_modified already carries the cross-cutting modification timestamp for
+		// race-guard ordering (ADR Decision 3); date_created is a parallel surface for the
+		// "create" event specifically. Each emitted only when the upstream value is non-null.
+		if (appointment.getCreator() != null) {
+			doc.putMetadata("creator_uuid", appointment.getCreator().getUuid());
+		}
+		if (appointment.getChangedBy() != null) {
+			doc.putMetadata("changed_by_uuid", appointment.getChangedBy().getUuid());
+		}
+		if (appointment.getDateCreated() != null) {
+			doc.putMetadata("date_created", appointment.getDateCreated().toInstant().toString());
+		}
+		// Rescheduling chain — when the appointment was created by reschedule(), it links back to
+		// the previous (now-cancelled) appointment via this field. Surface the UUID so a consumer
+		// can traverse the chain without querying core.
+		if (appointment.getRelatedAppointment() != null) {
+			doc.putMetadata("related_appointment_uuid", appointment.getRelatedAppointment().getUuid());
 		}
 		if (appointment.getComments() != null && !appointment.getComments().isEmpty()) {
 			doc.putMetadata("comments", appointment.getComments());
